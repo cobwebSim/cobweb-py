@@ -1147,6 +1147,111 @@ class TestSweepResult:
         assert "4 tickers" in repr(result)
 
 
+class TestSweepResultBacktestAll:
+    """Tests for SweepResult.backtest_all() and to_comparison_df()."""
+
+    def _make_result(self):
+        from cobweb_py.sweep import SweepRow, SweepResult
+        rows = [
+            SweepRow("AAPL", "BUY", 187.3, 3,
+                     [0.0, 1.0, 1.0, 1.0],
+                     [{"Close": 185}, {"Close": 186}, {"Close": 187}, {"Close": 187.3}]),
+            SweepRow("MSFT", "HOLD", 412.8, 2,
+                     [0.0, 0.0],
+                     [{"Close": 410}, {"Close": 412.8}]),
+        ]
+        return SweepResult(rows, elapsed_ms=1000, errors=[])
+
+    def _mock_sim(self):
+        """Return a mock CobwebSim that returns canned backtest results."""
+        from unittest.mock import MagicMock
+        sim = MagicMock()
+        sim.backtest.return_value = {
+            "metrics": {
+                "total_return": 0.15,
+                "sharpe_ann": 1.5,
+                "sortino_ann": 2.0,
+                "max_drawdown": -0.08,
+                "volatility_ann": 0.12,
+                "final_equity": 11500,
+                "trades": 12,
+                "bars": 250,
+            },
+            "trades": [],
+            "equity_curve": [],
+        }
+        return sim
+
+    def test_backtest_all_populates_backtest_field(self):
+        result = self._make_result()
+        sim = self._mock_sim()
+        result.backtest_all(sim, progress=False)
+        for row in result:
+            assert row.backtest is not None
+            assert "metrics" in row.backtest
+
+    def test_backtest_all_calls_sim_per_ticker(self):
+        result = self._make_result()
+        sim = self._mock_sim()
+        result.backtest_all(sim, progress=False)
+        assert sim.backtest.call_count == 2
+
+    def test_backtest_all_returns_self(self):
+        result = self._make_result()
+        sim = self._mock_sim()
+        ret = result.backtest_all(sim, progress=False)
+        assert ret is result
+
+    def test_backtest_all_passes_config_and_benchmark(self):
+        result = self._make_result()
+        sim = self._mock_sim()
+        config = {"initial_cash": 5000}
+        benchmark = {"rows": [{"Close": 100}]}
+        result.backtest_all(sim, config=config, benchmark=benchmark, progress=False)
+        call_kwargs = sim.backtest.call_args_list[0][1]
+        assert call_kwargs["config"] == config
+        assert call_kwargs["benchmark"] == benchmark
+
+    def test_backtest_all_skips_error_rows(self):
+        from cobweb_py.sweep import SweepRow, SweepResult
+        rows = [
+            SweepRow("AAPL", "BUY", 187.3, 3, [1.0], [{"Close": 187}]),
+            SweepRow("BAD", "HOLD", 0, 0, [], [], error="fetch failed"),
+        ]
+        result = SweepResult(rows, elapsed_ms=500, errors=[("BAD", "fetch failed")])
+        sim = self._mock_sim()
+        result.backtest_all(sim, progress=False)
+        assert sim.backtest.call_count == 1  # only AAPL
+        assert rows[1].backtest is None  # error row untouched
+
+    def test_to_comparison_df(self):
+        result = self._make_result()
+        sim = self._mock_sim()
+        result.backtest_all(sim, progress=False)
+        df = result.to_comparison_df()
+        assert len(df) == 2
+        assert df.index.name == "Ticker"
+        assert "AAPL" in df.index
+        assert "Total Return (%)" in df.columns
+        assert "Sharpe" in df.columns
+        assert df.loc["AAPL", "Total Return (%)"] == 15.0
+
+    def test_to_comparison_df_before_backtest(self):
+        result = self._make_result()
+        df = result.to_comparison_df()
+        assert len(df) == 0  # no backtests yet → empty
+
+    def test_backtest_all_handles_backtest_error(self):
+        from unittest.mock import MagicMock
+        result = self._make_result()
+        sim = MagicMock()
+        sim.backtest.side_effect = Exception("API error")
+        result.backtest_all(sim, progress=False)
+        for row in result:
+            assert row.backtest is not None
+            assert "error" in row.backtest
+
+
 class TestParamRow:
     def test_creation(self):
         from cobweb_py.sweep import ParamRow

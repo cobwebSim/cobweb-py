@@ -239,6 +239,7 @@ class SweepRow:
     signals: List[float]                     # full signal series
     enriched_rows: List[Dict[str, Any]]      # full enriched data (for drill-down)
     error: Optional[str] = None              # None if success
+    backtest: Optional[Dict[str, Any]] = None  # populated by backtest_all()
 
 
 class SweepResult:
@@ -334,6 +335,105 @@ class SweepResult:
         print(" | ".join(parts))
         print(f"Completed in {self.elapsed_ms / 1000:.1f}s")
         print()
+
+    # --- Backtesting ---
+
+    def backtest_all(
+        self,
+        sim: CobwebSim,
+        *,
+        config: Optional[Union[Dict, BacktestConfig]] = None,
+        benchmark: Any = None,
+        max_workers: int = 4,
+        progress: bool = True,
+    ) -> "SweepResult":
+        """
+        Run backtests on all sweep rows using their pre-computed signals.
+
+        Populates each :class:`SweepRow`'s ``backtest`` field with the full
+        backtest result dict.  Returns *self* for chaining.
+
+        Args:
+            sim:          Connected :class:`CobwebSim` client.
+            config:       Shared :class:`BacktestConfig` for all tickers.
+            benchmark:    Benchmark data for alpha/beta metrics.
+            max_workers:  Thread pool size for parallel backtest calls.
+            progress:     Print progress to stdout.
+
+        Example::
+
+            result = cw.market_sweep(sim, tickers, weights=WEIGHTS)
+            result.backtest_all(sim, config=CONFIG, benchmark=bench_df)
+            result.to_comparison_df()
+        """
+        ok_rows = [r for r in self.rows if r.error is None]
+        total = len(ok_rows)
+
+        def _bt_one(row: SweepRow, idx: int) -> None:
+            bt = sim.backtest(
+                {"rows": row.enriched_rows},
+                signals=row.signals,
+                compute_features=True,
+                feature_ids=[70, 71],
+                benchmark=benchmark,
+                config=config,
+            )
+            row.backtest = bt
+            if progress:
+                m = bt.get("metrics", {})
+                ret = m.get("total_return", 0)
+                sharpe = m.get("sharpe", 0) or m.get("sharpe_ann", 0)
+                print(f"[{idx}/{total}] {row.ticker}: "
+                      f"return={ret:+.1%}  sharpe={sharpe:.2f}")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_bt_one, row, i + 1): row
+                for i, row in enumerate(ok_rows)
+            }
+            for future in as_completed(futures):
+                row = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    row.backtest = {"error": str(e), "metrics": {}}
+                    if progress:
+                        print(f"  {row.ticker}: backtest error - {e}")
+
+        return self
+
+    def to_comparison_df(self) -> pd.DataFrame:
+        """
+        Build a comparison DataFrame with backtest metrics for all tickers.
+
+        Requires :meth:`backtest_all` to have been called first.
+
+        Returns:
+            DataFrame indexed by ticker with columns: Signal, Close,
+            Total Return, Sharpe, Sortino, Max Drawdown, Volatility,
+            VaR, CVaR, Trades, Bars.
+        """
+        records = []
+        for r in self.rows:
+            if r.error is not None or r.backtest is None:
+                continue
+            m = r.backtest.get("metrics", {})
+            records.append({
+                "Ticker": r.ticker,
+                "Signal": r.signal,
+                "Close": r.close,
+                "Total Return (%)": round(m.get("total_return", 0) * 100, 2),
+                "Sharpe": round(m.get("sharpe_ann", 0) or 0, 2),
+                "Sortino": round(m.get("sortino_ann", 0) or 0, 2),
+                "Max DD (%)": round(m.get("max_drawdown", 0) * 100, 2),
+                "Volatility": round(m.get("volatility_ann", 0) or 0, 4),
+                "Final Equity": round(m.get("final_equity", 0), 2),
+                "Trades": m.get("trades", 0),
+                "Bars": m.get("bars", 0),
+            })
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(records).set_index("Ticker")
 
     # --- Dunder ---
 

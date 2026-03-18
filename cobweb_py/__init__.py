@@ -1,6 +1,6 @@
 """cobweb-py - Python client for CobwebSim."""
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 from .client import CobwebSim, CobwebError, BacktestConfig, from_yfinance, from_alpaca
 from .scoring import (
