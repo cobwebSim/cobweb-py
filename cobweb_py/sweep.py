@@ -661,32 +661,28 @@ def _compute_signal_age(signals: List[float]) -> int:
     return age
 
 
-def _sweep_one_ticker(
+def _enrich_and_signal(
     sim: CobwebSim,
     ticker: str,
+    data: Any,
     strategy: Callable[[Rows], List[float]],
-    start: str,
-    end: Optional[str],
     feature_ids: Optional[List[int]],
 ) -> SweepRow:
-    """Process a single ticker for market_sweep. Runs in a worker thread."""
-    # 1. Fetch data
-    data = from_yfinance(ticker, start, end)
-
-    # 2. Enrich
+    """Enrich pre-fetched data and run strategy. Thread-safe (no yfinance)."""
+    # 1. Enrich
     resp = sim.enrich(data, feature_ids=feature_ids)
     enriched = resp.get("rows", [])
     if not enriched:
         raise CobwebError(f"No enriched rows for {ticker}")
 
-    # 3. Run strategy
+    # 2. Run strategy
     signals = strategy(enriched)
     if len(signals) != len(enriched):
         raise CobwebError(
             f"Strategy returned {len(signals)} signals for {len(enriched)} rows"
         )
 
-    # 4. Extract latest info
+    # 3. Extract latest info
     latest = enriched[-1]
     close_col = "Close" if "Close" in latest else "close"
     latest_close = float(latest.get(close_col, 0.0))
@@ -775,23 +771,36 @@ def market_sweep(
     errors: List[Tuple[str, str]] = []
     total = len(tickers)
 
-    def _process(ticker: str, idx: int) -> SweepRow:
-        row = _sweep_one_ticker(sim, ticker, _strategy, start, end, feature_ids)
-        if progress:
-            print(f"[{idx}/{total}] {ticker}: {row.signal}")
-        return row
+    # Step 1: Download data SEQUENTIALLY (yfinance is not thread-safe)
+    ticker_data: Dict[str, Any] = {}
+    for i, t in enumerate(tickers):
+        try:
+            data = from_yfinance(t, start, end)
+            ticker_data[t] = data
+            if progress:
+                print(f"[download {i+1}/{total}] {t}: OK")
+        except Exception as e:
+            err_msg = str(e)
+            errors.append((t, err_msg))
+            if on_error == "raise":
+                raise
+            elif on_error == "warn":
+                warnings.warn(f"market_sweep: {t} download failed: {err_msg}", stacklevel=2)
+                if progress:
+                    print(f"[download {i+1}/{total}] {t}: ERROR - {err_msg}")
 
+    # Step 2: Enrich + strategy IN PARALLEL (thread-safe API calls)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(_sweep_one_ticker, sim, t, _strategy, start, end, feature_ids): (t, i + 1)
-            for i, t in enumerate(tickers)
+            pool.submit(_enrich_and_signal, sim, t, d, _strategy, feature_ids): (t, i + 1)
+            for i, (t, d) in enumerate(ticker_data.items())
         }
         for future in as_completed(futures):
             ticker, idx = futures[future]
             try:
                 row = future.result()
                 if progress:
-                    print(f"[{idx}/{total}] {ticker}: {row.signal}")
+                    print(f"[{idx}/{len(ticker_data)}] {ticker}: {row.signal}")
                 results.append(row)
             except Exception as e:
                 err_msg = str(e)
@@ -801,8 +810,7 @@ def market_sweep(
                 elif on_error == "warn":
                     warnings.warn(f"market_sweep: {ticker} failed: {err_msg}", stacklevel=2)
                     if progress:
-                        print(f"[{idx}/{total}] {ticker}: ERROR - {err_msg}")
-                # on_error == "skip": silently skip
+                        print(f"[{idx}/{len(ticker_data)}] {ticker}: ERROR - {err_msg}")
 
     elapsed = (time.time() - t0) * 1000
     return SweepResult(results, elapsed, errors)
