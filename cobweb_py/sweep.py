@@ -699,6 +699,54 @@ def _enrich_and_signal(
     )
 
 
+def _split_multi_ticker_df(
+    df: pd.DataFrame,
+    tickers: List[str],
+) -> Dict[str, pd.DataFrame]:
+    """
+    Split a multi-ticker yfinance DataFrame (MultiIndex columns) into
+    per-ticker DataFrames.
+
+    Handles both ``group_by="ticker"`` format (level-0 = ticker) and
+    default format (level-0 = Price field, level-1 = ticker).
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise CobwebError(
+            "Expected a MultiIndex DataFrame from yf.download(). "
+            "Got single-level columns."
+        )
+
+    level_0 = df.columns.get_level_values(0).unique().tolist()
+    level_1 = df.columns.get_level_values(1).unique().tolist()
+
+    # Detect format: if level-0 contains ticker names, it's group_by="ticker"
+    ticker_set = set(t.upper() for t in tickers)
+    l0_upper = set(str(x).upper() for x in level_0)
+
+    if ticker_set & l0_upper:
+        # group_by="ticker": level-0 = ticker, level-1 = OHLCV field
+        result = {}
+        for t in tickers:
+            try:
+                sub = df[t].copy().dropna(how="all")
+                sub = sub.reset_index()
+                result[t] = sub
+            except KeyError:
+                pass
+        return result
+    else:
+        # Default yfinance format: level-0 = field (Close, High, ...), level-1 = ticker
+        result = {}
+        for t in tickers:
+            try:
+                sub = df.xs(t, level=1, axis=1).copy().dropna(how="all")
+                sub = sub.reset_index()
+                result[t] = sub
+            except KeyError:
+                pass
+        return result
+
+
 def market_sweep(
     sim: CobwebSim,
     tickers: List[str],
@@ -710,6 +758,7 @@ def market_sweep(
     exit_th: float = 0.05,
     use_shorts: bool = False,
     # Data options
+    data: Optional[Union[pd.DataFrame, Dict[str, Any]]] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
     feature_ids: Optional[List[int]] = None,
@@ -733,8 +782,16 @@ def market_sweep(
         entry_th:     Entry threshold (used with *weights* shorthand).
         exit_th:      Exit threshold (used with *weights* shorthand).
         use_shorts:   Enable shorts (used with *weights* shorthand).
+        data:         Pre-fetched data. Can be:
+
+                      - A multi-ticker ``yf.download()`` DataFrame (fastest)
+                      - A ``dict`` mapping ticker → DataFrame/rows
+
+                      If ``None``, downloads from yfinance using *start*/*end*.
         start:        yfinance start date (default ``"2023-01-01"``).
+                      Ignored if *data* is provided.
         end:          yfinance end date (default: today).
+                      Ignored if *data* is provided.
         feature_ids:  Feature IDs to enrich (default: all 71).
         max_workers:  Thread pool size for parallel processing.
         on_error:     ``"warn"`` (default), ``"raise"``, or ``"skip"``.
@@ -745,13 +802,19 @@ def market_sweep(
 
     Example::
 
-        # Shorthand (weights-based):
-        result = market_sweep(sim, ["AAPL", "MSFT"],
+        # Batch download (fastest — one HTTP call for all tickers):
+        import yfinance as yf
+        df = yf.download(tickers, start="2020-01-01", end="2024-12-31")
+        result = market_sweep(sim, tickers, data=df,
                               weights={36: 0.3, 11: 0.3, 1: 0.4})
 
-        # Custom strategy:
-        result = market_sweep(sim, ["AAPL", "MSFT"],
-                              strategy=my_ml_strategy)
+        # Auto-download (sequential, slower):
+        result = market_sweep(sim, tickers,
+                              weights={36: 0.3, 11: 0.3, 1: 0.4})
+
+        # Pre-fetched dict:
+        result = market_sweep(sim, tickers, data={"AAPL": aapl_df, ...},
+                              strategy=my_strategy)
     """
     # Resolve strategy
     if strategy is not None:
@@ -771,23 +834,61 @@ def market_sweep(
     errors: List[Tuple[str, str]] = []
     total = len(tickers)
 
-    # Step 1: Download data SEQUENTIALLY (yfinance is not thread-safe)
+    # Step 1: Resolve per-ticker data
     ticker_data: Dict[str, Any] = {}
-    for i, t in enumerate(tickers):
-        try:
-            data = from_yfinance(t, start, end)
-            ticker_data[t] = data
-            if progress:
-                print(f"[download {i+1}/{total}] {t}: OK")
-        except Exception as e:
-            err_msg = str(e)
-            errors.append((t, err_msg))
-            if on_error == "raise":
-                raise
-            elif on_error == "warn":
-                warnings.warn(f"market_sweep: {t} download failed: {err_msg}", stacklevel=2)
+
+    if data is not None:
+        # Pre-fetched data provided
+        if isinstance(data, pd.DataFrame):
+            if isinstance(data.columns, pd.MultiIndex):
+                # Multi-ticker yfinance DataFrame
                 if progress:
-                    print(f"[download {i+1}/{total}] {t}: ERROR - {err_msg}")
+                    print(f"[data] Splitting multi-ticker DataFrame for {total} tickers...")
+                ticker_data = _split_multi_ticker_df(data, tickers)
+                missing = [t for t in tickers if t not in ticker_data]
+                for t in missing:
+                    errors.append((t, f"Ticker {t} not found in provided DataFrame"))
+                    if on_error == "warn":
+                        warnings.warn(f"market_sweep: {t} not in DataFrame", stacklevel=2)
+            else:
+                raise CobwebError(
+                    "Single-ticker DataFrame passed as `data`. "
+                    "Use a dict mapping ticker → DataFrame, or pass "
+                    "a multi-ticker yf.download() result."
+                )
+        elif isinstance(data, dict):
+            # Dict mapping ticker → data
+            for t in tickers:
+                if t in data:
+                    ticker_data[t] = data[t]
+                else:
+                    errors.append((t, f"Ticker {t} not found in data dict"))
+                    if on_error == "warn":
+                        warnings.warn(f"market_sweep: {t} not in data dict", stacklevel=2)
+        else:
+            raise CobwebError(
+                "Unsupported `data` type. Use a multi-ticker DataFrame "
+                "from yf.download(), or a dict mapping ticker → DataFrame."
+            )
+        if progress:
+            print(f"[data] {len(ticker_data)}/{total} tickers ready")
+    else:
+        # Download SEQUENTIALLY (yfinance is not thread-safe)
+        for i, t in enumerate(tickers):
+            try:
+                fetched = from_yfinance(t, start, end)
+                ticker_data[t] = fetched
+                if progress:
+                    print(f"[download {i+1}/{total}] {t}: OK")
+            except Exception as e:
+                err_msg = str(e)
+                errors.append((t, err_msg))
+                if on_error == "raise":
+                    raise
+                elif on_error == "warn":
+                    warnings.warn(f"market_sweep: {t} download failed: {err_msg}", stacklevel=2)
+                    if progress:
+                        print(f"[download {i+1}/{total}] {t}: ERROR - {err_msg}")
 
     # Step 2: Enrich + strategy IN PARALLEL (thread-safe API calls)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

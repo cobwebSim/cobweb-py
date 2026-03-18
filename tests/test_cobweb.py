@@ -1470,6 +1470,99 @@ class TestParamSweepValidation:
         assert len(result) == 3
 
 
+class TestSplitMultiTickerDf:
+    """Tests for _split_multi_ticker_df and market_sweep data= parameter."""
+
+    def test_split_default_yfinance_format(self):
+        """Default yf.download format: level-0 = field, level-1 = ticker."""
+        from cobweb_py.sweep import _split_multi_ticker_df
+        arrays = [
+            ["Close", "Close", "High", "High"],
+            ["AAPL", "MSFT", "AAPL", "MSFT"],
+        ]
+        cols = pd.MultiIndex.from_arrays(arrays, names=["Price", "Ticker"])
+        df = pd.DataFrame(
+            [[150.0, 400.0, 155.0, 405.0], [151.0, 401.0, 156.0, 406.0]],
+            columns=cols,
+        )
+        df.index.name = "Date"
+        result = _split_multi_ticker_df(df, ["AAPL", "MSFT"])
+        assert "AAPL" in result
+        assert "MSFT" in result
+        assert "Close" in result["AAPL"].columns
+        assert len(result["AAPL"]) == 2
+
+    def test_split_group_by_ticker_format(self):
+        """group_by='ticker' format: level-0 = ticker, level-1 = field."""
+        from cobweb_py.sweep import _split_multi_ticker_df
+        arrays = [
+            ["AAPL", "AAPL", "MSFT", "MSFT"],
+            ["Close", "High", "Close", "High"],
+        ]
+        cols = pd.MultiIndex.from_arrays(arrays)
+        df = pd.DataFrame(
+            [[150.0, 155.0, 400.0, 405.0]],
+            columns=cols,
+        )
+        df.index.name = "Date"
+        result = _split_multi_ticker_df(df, ["AAPL", "MSFT"])
+        assert "AAPL" in result
+        assert "Close" in result["AAPL"].columns
+
+    def test_split_missing_ticker(self):
+        """Tickers not in the DataFrame are silently skipped."""
+        from cobweb_py.sweep import _split_multi_ticker_df
+        arrays = [
+            ["Close", "Close"],
+            ["AAPL", "MSFT"],
+        ]
+        cols = pd.MultiIndex.from_arrays(arrays, names=["Price", "Ticker"])
+        df = pd.DataFrame([[150.0, 400.0]], columns=cols)
+        df.index.name = "Date"
+        result = _split_multi_ticker_df(df, ["AAPL", "GOOGL"])
+        assert "AAPL" in result
+        assert "GOOGL" not in result
+
+    def test_market_sweep_with_data_dict(self):
+        """market_sweep accepts data= as a dict of ticker → data."""
+        from cobweb_py.sweep import market_sweep
+        sim = MagicMock()
+        sim.enrich.return_value = {"rows": _make_enriched_rows()}
+
+        data = {
+            "AAPL": {"rows": _make_enriched_rows()},
+            "MSFT": {"rows": _make_enriched_rows()},
+        }
+        result = market_sweep(
+            sim, ["AAPL", "MSFT"],
+            weights={36: 0.3, 1: 0.7},
+            data=data,
+            max_workers=1,
+            progress=False,
+        )
+        assert len(result) == 2
+        # Should NOT call from_yfinance when data is provided
+        assert sim.enrich.call_count == 2
+
+    def test_market_sweep_with_data_dict_missing_ticker(self):
+        """Missing tickers in data dict are reported as errors."""
+        from cobweb_py.sweep import market_sweep
+        sim = MagicMock()
+        sim.enrich.return_value = {"rows": _make_enriched_rows()}
+
+        data = {"AAPL": {"rows": _make_enriched_rows()}}
+        result = market_sweep(
+            sim, ["AAPL", "MISSING"],
+            weights={36: 0.3, 1: 0.7},
+            data=data,
+            max_workers=1,
+            progress=False,
+        )
+        assert len(result) == 1
+        assert len(result.errors) == 1
+        assert result.errors[0][0] == "MISSING"
+
+
 class TestSweepExports:
     def test_all_exports_present(self):
         import cobweb_py
