@@ -2,19 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union, Sequence
+import warnings
 
-from .client import CobwebSim, BacktestConfig
+from .client import CobwebSim, CobwebError, BacktestConfig
 from .scoring import score, auto_score, score_by_id
 from .plots import (
     save_equity_plot, save_score_plot, save_price_and_score_plot,
     save_features_table, payloads_to_figures,
 )
-from .utils import to_signals, get_signal, get_plot, load_csv, align
+from .utils import to_signals, get_signal, get_plot, load_csv, align, format_metrics, print_signal
 
-try:
-    import pandas as pd
-except Exception:  # pragma: no cover
-    pd = None  # type: ignore
+import pandas as pd
 
 
 def quickstart(
@@ -48,27 +46,21 @@ def quickstart(
 
     sim = CobwebSim(base_url, api_key=api_key)
 
-    # Optionally normalize day-first timestamps (client-side) before hitting API
+    # Optionally normalize day-first timestamps (client-side) before hitting API.
+    # Uses load_csv which auto-detects timestamp columns (Date, Datetime, time, etc.)
+    # instead of requiring a literal "timestamp" column.
     data_for_api: Union[str, Path, Dict[str, Any]] = csv_path
     if normalize_dayfirst_timestamps:
-        if pd is None:
-            raise RuntimeError("normalize_dayfirst_timestamps=True requires pandas. Install with: pip install pandas")
-
-        df = pd.read_csv(csv_path)
-        if "timestamp" not in df.columns:
-            raise RuntimeError("CSV must contain a 'timestamp' column to normalize timestamps.")
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", dayfirst=True)
-        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-        df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        data_for_api = load_csv(csv_path, name="ASSET", dayfirst=True)
         if max_rows is not None:
-            df = df.head(int(max_rows))
-        data_for_api = {"rows": df.to_dict("records")}
+            rows_list = data_for_api.get("rows", [])
+            data_for_api = {"rows": rows_list[:int(max_rows)]}
 
     feats = sim.enrich(data_for_api, feature_ids=feature_ids, max_rows=max_rows)
 
     rows = feats.get("rows", [])
     if not rows:
-        raise RuntimeError("No rows returned from enrich().")
+        raise CobwebError("No rows returned from enrich().")
 
     # --- tables: html + csv ---
     features_html = out_dir / "features_table.html"
@@ -118,26 +110,36 @@ def quickstart(
     }
 
 
-def _ensure_feature_deps(feature_ids: Optional[Sequence[int]], plot_ids: Optional[Sequence[int]]) -> List[int]:
+def _ensure_feature_deps(
+    feature_ids: Optional[Sequence[int]],
+    plot_ids: Optional[Sequence[int]],
+) -> Optional[List[int]]:
     """
     Auto-add required feature IDs for certain plot IDs.
 
     - plot 21 (performance_by_trend_regime) needs trend_regime (70)
     - plot 20 (performance_by_volatility_regime) needs vol_regime (71)
+
+    Returns None when both inputs are None (preserves "compute all" default).
     """
-    feature_ids_set = set(int(x) for x in (feature_ids or []))
     plot_ids_set = set(int(x) for x in (plot_ids or []))
+
+    # If no feature_ids and no plot deps needed, return None (= compute all)
+    if feature_ids is None and not (21 in plot_ids_set or 20 in plot_ids_set):
+        return None
+
+    feature_ids_set = set(int(x) for x in (feature_ids or []))
 
     if 21 in plot_ids_set:  # performance_by_trend_regime
         feature_ids_set.add(70)  # trend_regime
     if 20 in plot_ids_set:  # performance_by_volatility_regime
         feature_ids_set.add(71)  # vol_regime
 
-    return sorted(feature_ids_set)
+    return sorted(feature_ids_set) if feature_ids_set else None
 
 
 # ---------------------------------------------------------------------------
-# Pipeline — reusable enrich-once, run-many workflow
+# Pipeline -- reusable enrich-once, run-many workflow
 # ---------------------------------------------------------------------------
 
 class Pipeline:
@@ -244,7 +246,7 @@ class Pipeline:
         resp = self._sim.enrich(self._base_rows, feature_ids=self._feature_ids)
         rows = resp.get("rows", [])
         if not rows:
-            raise RuntimeError("No rows returned from enrich().")
+            raise CobwebError("No rows returned from enrich().")
 
         self._enriched_rows = rows
         self._base_rows = {"rows": rows}
@@ -274,7 +276,7 @@ class Pipeline:
         layout_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Run the full pipeline: score → signals → backtest → plots.
+        Run the full pipeline: score -> signals -> backtest -> plots.
 
         Auto-enriches if not yet done.  The enrichment is cached and reused;
         everything else reruns with each call.
@@ -287,7 +289,9 @@ class Pipeline:
             exit_th:          Score threshold to exit a position.
             use_shorts:       Allow short positions in signal generation.
             config:           ``BacktestConfig`` or dict of backtest parameters.
-            plot_ids:         List of plot IDs to request (default: all 27).
+            plot_ids:         List of plot IDs to fetch (default: all 27).
+                              These are fetched individually via ``get_plot()``,
+                              not passed to the backtest call.
             layout_overrides: Dict passed to each Plotly figure's
                               ``update_layout()``.
 
@@ -330,7 +334,7 @@ class Pipeline:
         # --- Signal info ---
         signal_info = get_signal(bt)
 
-        # --- Plots (via API) ---
+        # --- Plots (fetched individually via API) ---
         figures: Dict[str, Any] = {}
         for pid in effective_plot_ids:
             try:
@@ -339,19 +343,144 @@ class Pipeline:
                     benchmark_rows=self._benchmark_rows,
                     all_feature_ids=list(range(1, 72)),
                 )
-            except Exception:
+            except Exception as e:
+                warnings.warn(
+                    f"Pipeline.run(): plot_id={pid} failed: {e}",
+                    stacklevel=2,
+                )
                 continue
             payloads = pl.get("payloads", {}) or {}
             figs = payloads_to_figures(payloads, layout_overrides=layout_overrides)
             figures.update(figs)
 
-        return {
-            "metrics": bt.get("metrics", {}),
-            "signal": signal_info,
-            "trades": bt.get("trades", []),
-            "scores": scores,
-            "signals": signals,
-            "equity_curve": bt.get("equity_curve", []),
-            "backtest": bt,
-            "figures": figures,
-        }
+        return DeployableResult(
+            metrics=bt.get("metrics", {}),
+            signal=signal_info,
+            trades=bt.get("trades", []),
+            scores=scores,
+            signals=signals,
+            equity_curve=bt.get("equity_curve", []),
+            backtest=bt,
+            figures=figures,
+        )
+
+
+# ---------------------------------------------------------------------------
+# DeployableResult -- dict-like result with deploy(), print_metrics(), etc.
+# ---------------------------------------------------------------------------
+
+class DeployableResult(dict):
+    """
+    Result from ``Pipeline.run()`` with convenience methods for deployment.
+
+    Behaves like a regular dict (backward-compatible) but adds:
+
+    - ``.print_metrics()`` -- pretty-print backtest metrics
+    - ``.print_signal()``  -- pretty-print the current trading signal
+    - ``.deploy(broker)``  -- deploy the signal to a live/paper broker
+
+    Example::
+
+        result = pipe.run(weights={11: 0.3, 36: 0.3, 14: 0.4})
+        result.print_metrics()
+        result.print_signal()
+        result.deploy(broker, symbol="AAPL", dry_run=True)
+    """
+
+    def __init__(
+        self,
+        metrics: Dict,
+        signal: Dict,
+        trades: list,
+        scores: list,
+        signals: list,
+        equity_curve: list,
+        backtest: Dict,
+        figures: Dict,
+    ):
+        super().__init__(
+            metrics=metrics,
+            signal=signal,
+            trades=trades,
+            scores=scores,
+            signals=signals,
+            equity_curve=equity_curve,
+            backtest=backtest,
+            figures=figures,
+        )
+
+    def print_metrics(self) -> None:
+        """Pretty-print backtest performance metrics."""
+        bt = self["backtest"]
+        formatted = format_metrics(bt)
+        print()
+        print("=" * 50)
+        print("BACKTEST RESULTS")
+        print("=" * 50)
+        for key, val in formatted.items():
+            print(f"  {key}: {val}")
+        print()
+
+    def print_signal(self) -> None:
+        """Pretty-print the current trading signal."""
+        print()
+        print("=" * 50)
+        print("CURRENT SIGNAL")
+        print("=" * 50)
+        bt = self["backtest"]
+        print_signal(bt)
+        print()
+
+    def deploy(
+        self,
+        broker: Any,
+        symbol: str,
+        *,
+        price: Optional[float] = None,
+        sizer: Any = None,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Deploy the current signal to a broker.
+
+        Args:
+            broker:   A connected broker instance (e.g. ``cw.AlpacaBroker(paper=True)``).
+            symbol:   Ticker symbol to trade (e.g. "AAPL").
+            price:    Override price for sizing. If None, fetched from broker.
+            sizer:    Position sizing strategy (e.g. ``cw.PercentOfEquity(0.95)``).
+                      Defaults to ``FullCash()``.
+            dry_run:  If True, log what *would* happen without placing orders.
+            force:    If True, skip duplicate signal check.
+
+        Returns:
+            Dict with keys: action, signal, symbol, qty, order.
+        """
+        from .execution import deploy as _deploy
+
+        signal_info = self["signal"]
+
+        account = broker.get_account_info()
+        print()
+        print("=" * 50)
+        print("DEPLOYING")
+        print("=" * 50)
+        print(f"  Account status: {account['status']}")
+        print(f"  Buying power:   ${account['buying_power']:,.2f}")
+        print(f"  Portfolio value: ${account['portfolio_value']:,.2f}")
+        current_qty = broker.get_position(symbol)
+        if current_qty > 0:
+            print(f"  Current {symbol}:   {current_qty} shares")
+        else:
+            print(f"  Current {symbol}:   No position")
+        print()
+
+        return _deploy(
+            signal_info,
+            broker,
+            symbol,
+            price=price,
+            sizer=sizer,
+            dry_run=dry_run,
+            force=force,
+        )

@@ -28,44 +28,47 @@ Requires Python 3.9+. No API key required.
 ## Quick Start
 
 ```python
-from cobweb_py import CobwebSim, BacktestConfig, fix_timestamps, to_signals, score_by_id
-import yfinance as yf
+import cobweb_py as cw
 
-# 1. Connect
-sim = CobwebSim("https://web-production-83f3e.up.railway.app")
+# 1. Connect & download data
+sim = cw.CobwebSim("https://web-production-83f3e.up.railway.app")
+asset_df = cw.from_yfinance("AAPL", "2020-01-01", "2024-12-31")
+bench_df = cw.from_yfinance("SPY", "2020-01-01", "2024-12-31")
 
-# 2. Download data
-df = yf.download("AAPL", start="2020-01-01", end="2024-12-31")
-df.columns = df.columns.get_level_values(0)
-df = df.reset_index().rename(columns={"Date": "timestamp"})
-rows = df[["timestamp", "Open", "High", "Low", "Close", "Volume"]].to_dict("records")
-data = fix_timestamps(rows)
+# 2. Enrich with technical features
+rows = sim.enrich_rows(asset_df, feature_ids=[1, 2, 3, 11, 36, 14, 70, 71])
 
-# 3. Enrich with technical features
-feats = sim.enrich(data, feature_ids=[1, 11, 36])
-enriched_rows = feats["rows"]
+# 3. Score and generate signals
+scores = cw.score_by_id(rows, {11: 0.3, 36: 0.3, 14: 0.4})
+signals = cw.to_signals(scores, entry_th=0.20, exit_th=0.05, use_shorts=False)
 
-# 4. Score and generate signals
-scores = score_by_id(enriched_rows, {11: 0.3, 36: 0.3, 1: 0.4})
-signals = to_signals(scores, entry_th=0.20, exit_th=0.05, use_shorts=False)
+# 4. Backtest with realistic friction
+bt = sim.backtest(
+    rows, signals=signals,
+    compute_features=True, feature_ids=[70, 71],
+    benchmark=bench_df,
+    config=cw.BacktestConfig(initial_cash=10_000, exec_horizon="swing", fee_bps=1.0),
+)
 
-# 5. Backtest with realistic friction
-bt = sim.backtest(data, signals=signals, config=BacktestConfig(
-    initial_cash=10_000,
-    exec_horizon="swing",
-    fee_bps=1.0,
-))
+# 5. View results
+cw.print_signal(bt)
+metrics = cw.format_metrics(bt)
+for label, value in metrics.items():
+    print(f"{label}: {value}")
 
-print(f"Return: {bt['metrics']['total_return']:.2%}")
-print(f"Sharpe: {bt['metrics']['sharpe_ann']:.2f}")
-print(f"Max DD: {bt['metrics']['max_drawdown']:.2%}")
+# 6. Save interactive charts
+cw.plots.save_equity_plot(bt, out_html="out/equity.html")
+cw.plots.save_metrics_table(bt, out_html="out/metrics.html")
+cw.plots.save_trades_table(bt, out_html="out/trades.html")
+cw.plots.save_score_plot(rows, scores, out_html="out/score.html")
+cw.plots.save_price_and_score_plot(rows, scores, out_html="out/price_and_score.html")
 ```
 
 ## Examples
 
-See [cobweb-py-examples](https://github.com/cobwebSim/cobweb-py-examples) for 8 runnable Jupyter notebook examples.
+See [backtest_under_20](https://github.com/cobwebSim/backtest_under_20) for a complete walkthrough notebook with explanations.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cobwebSim/cobweb-py-examples/blob/main/cobweb_py_examples.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cobwebSim/backtest_under_20/blob/main/backtest.ipynb)
 
 ## API Reference
 

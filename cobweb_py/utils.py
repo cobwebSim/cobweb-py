@@ -1,13 +1,12 @@
 # cobweb_py/utils.py
 from __future__ import annotations
 
+from html import escape as _esc
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Iterable
+import warnings
 
-try:
-    import pandas as pd
-except Exception:  # pragma: no cover
-    pd = None  # type: ignore
+import pandas as pd
 
 from .client import CobwebSim, CobwebError
 from .scoring import PLOTS, _resolve_plot_id
@@ -32,36 +31,14 @@ def save_table(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Best effort: pandas to_html for correctness; fallback to manual HTML
-    if pd is not None:
-        try:
-            df = pd.DataFrame(rows[:max_rows])
-            html = df.to_html(index=False, border=0)
-            out_path.write_text(
-                f"<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>"
-                f"<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
-                f"<body style='font-family:sans-serif;padding:16px'>"
-                f"<h2>{title}</h2>{html}</body></html>",
-                encoding="utf-8",
-            )
-            return str(out_path)
-        except Exception:
-            pass
-
-    cols = list(rows[0].keys()) if rows else []
-    header = "".join(f"<th style='text-align:left;padding:8px;border-bottom:1px solid #ddd'>{c}</th>" for c in cols)
-    body = ""
-    for r in rows[:max_rows]:
-        body += "<tr>" + "".join(
-            f"<td style='padding:6px 8px;border-bottom:1px solid #eee'>{r.get(c,'')}</td>" for c in cols
-        ) + "</tr>"
-    table = f"<table style='border-collapse:collapse;width:100%'><tr>{header}</tr>{body}</table>" if rows else "<p>(no rows)</p>"
-
+    safe_title = _esc(title)
+    df = pd.DataFrame(rows[:max_rows])
+    html = df.to_html(index=False, border=0)
     out_path.write_text(
-        f"<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>"
+        f"<!doctype html><html><head><meta charset='utf-8'><title>{safe_title}</title>"
         f"<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
         f"<body style='font-family:sans-serif;padding:16px'>"
-        f"<h2>{title}</h2>{table}</body></html>",
+        f"<h2>{safe_title}</h2>{html}</body></html>",
         encoding="utf-8",
     )
     return str(out_path)
@@ -83,12 +60,9 @@ def fix_timestamps(
     Handles day-first formats like: '14/09/2020 00:00'.
     Returns {"rows": [...]} (API-ready).
     """
-    if pd is None:
-        raise RuntimeError("pandas is required for fix_timestamps(). Install with: pip install pandas")
-
     df = pd.DataFrame(rows).copy()
     if timestamp_col not in df.columns:
-        raise RuntimeError(f"{name}: missing '{timestamp_col}' column")
+        raise CobwebError(f"{name}: missing '{timestamp_col}' column")
 
     df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce", dayfirst=dayfirst)
 
@@ -124,8 +98,6 @@ def load_csv(
         base_rows = load_csv("apple_data.csv", name="ASSET")
         benchmark_rows = load_csv("spy.csv", name="BENCHMARK")
     """
-    if pd is None:
-        raise RuntimeError("pandas is required for load_csv(). Install with: pip install pandas")
     df = pd.read_csv(csv_path)
 
     # Normalise OHLCV column names to lowercase to match the API schema
@@ -142,7 +114,7 @@ def load_csv(
         ts_col = next((lower_map[k] for k in ("timestamp", "time", "date", "datetime") if k in lower_map), None)
 
     if ts_col is None:
-        # No recognisable timestamp column — return rows as-is
+        # No recognisable timestamp column -- return rows as-is
         return {"rows": df.to_dict("records")}
 
     # Normalise to "timestamp" so align() and the API always see the same key.
@@ -166,25 +138,33 @@ def align(
 
     Input must be {"rows":[...]} and timestamps should already be parseable.
     Returns trimmed (A, B) as {"rows": [...]} each, aligned on common timestamps.
-    """
-    if pd is None:
-        raise RuntimeError("pandas is required for align(). Install with: pip install pandas")
 
+    Note:
+        Timestamps are normalised to UTC internally so that resolution mismatches
+        (e.g. yfinance us vs s) do not cause merge errors.  Non-UTC timezone-aware
+        timestamps are converted to UTC; timezone-naive timestamps are assumed UTC.
+    """
     a_df = pd.DataFrame(a_rows.get("rows", [])).copy()
     b_df = pd.DataFrame(b_rows.get("rows", [])).copy()
 
     if timestamp_col not in a_df.columns or timestamp_col not in b_df.columns:
-        raise RuntimeError(f"Missing '{timestamp_col}' in {a_name} or {b_name}")
+        raise CobwebError(f"Missing '{timestamp_col}' in {a_name} or {b_name}")
 
-    a_df[timestamp_col] = pd.to_datetime(a_df[timestamp_col], errors="coerce")
-    b_df[timestamp_col] = pd.to_datetime(b_df[timestamp_col], errors="coerce")
+    a_df[timestamp_col] = pd.to_datetime(a_df[timestamp_col], errors="coerce", utc=True)
+    b_df[timestamp_col] = pd.to_datetime(b_df[timestamp_col], errors="coerce", utc=True)
 
     a_df = a_df.dropna(subset=[timestamp_col]).copy()
     b_df = b_df.dropna(subset=[timestamp_col]).copy()
 
+    # Normalize resolution so set intersection works even when
+    # sources have different precisions (e.g. yfinance us vs s)
+    _NORM_DTYPE = "datetime64[ns, UTC]"
+    a_df[timestamp_col] = a_df[timestamp_col].astype(_NORM_DTYPE)
+    b_df[timestamp_col] = b_df[timestamp_col].astype(_NORM_DTYPE)
+
     common = set(a_df[timestamp_col]).intersection(set(b_df[timestamp_col]))
     if not common:
-        raise RuntimeError(
+        raise CobwebError(
             f"{a_name} and {b_name} have no overlapping timestamps. "
             f"Use matching date ranges and bar size."
         )
@@ -212,12 +192,19 @@ def to_signals(
     - If shorts enabled:
         enter short if score <= -entry_th
         exit short if score >= -exit_th
+
+    NaN scores are treated as 0.0 (no signal change).
     """
     signals: List[float] = []
     pos = 0
 
     for s in scores:
         s = float(s)
+        # NaN/inf guard: treat non-finite as neutral
+        if not (s == s) or s == float("inf") or s == float("-inf"):
+            signals.append(float(pos))
+            continue
+
         if not use_shorts:
             if pos == 0 and s >= entry_th:
                 pos = 1
@@ -263,10 +250,10 @@ def get_plot(
 
     plot_id examples:
         get_plot(sim, rows, bt, 5)              # by ID
-        get_plot(sim, rows, bt, "sharpe")       # → rolling_sharpe (ID 5)
-        get_plot(sim, rows, bt, "drawdown")     # → ambiguous, be more specific
-        get_plot(sim, rows, bt, "drawdown_u")   # → drawdown_underwater (ID 10)
-        get_plot(sim, rows, bt, "equity_lin")   # → equity_curve_linear (ID 1)
+        get_plot(sim, rows, bt, "sharpe")       # -> rolling_sharpe (ID 5)
+        get_plot(sim, rows, bt, "drawdown")     # -> ambiguous, be more specific
+        get_plot(sim, rows, bt, "drawdown_u")   # -> drawdown_underwater (ID 10)
+        get_plot(sim, rows, bt, "equity_lin")   # -> equity_curve_linear (ID 1)
 
     Returns the same shape as sim.plots(), typically {"payloads": {...}}.
     """
@@ -304,6 +291,56 @@ def get_plot(
     return sim.plots(data_rows, backtest_result=bt, plot_ids=[pid])
 
 
+def get_plot_df(
+    sim: CobwebSim,
+    data_rows: RowsDict,
+    bt: Dict[str, Any],
+    plot_id: Union[int, str],
+    benchmark_rows: Optional[RowsDict] = None,
+    *,
+    all_feature_ids: Optional[Sequence[int]] = None,
+) -> "pd.DataFrame":
+    """
+    Fetch a single plot by ID or fuzzy name and return its data as a DataFrame.
+
+    Combines :func:`get_plot` and :func:`payload_to_df` into one call so the
+    user never needs to know the internal payload key name.
+
+    Parameters
+    ----------
+    sim : CobwebSim
+        Connected client instance.
+    data_rows : RowsDict
+        Enriched OHLCV rows (list or ``{"rows": [...]}``).
+    bt : dict
+        Backtest result from ``sim.backtest()``.
+    plot_id : int or str
+        Plot ID (1-27) or fuzzy name (e.g. ``"sharpe"``, ``"drawdown"``).
+    benchmark_rows : optional
+        Benchmark data (needed for plots 3, 8, 9).
+    all_feature_ids : optional
+        Required for correlation heatmap (plot 23).
+
+    Returns
+    -------
+    pd.DataFrame
+        The plot data as a pandas DataFrame.
+    """
+    from .plots import payload_to_df
+
+    pl = get_plot(
+        sim, data_rows, bt, plot_id,
+        benchmark_rows=benchmark_rows,
+        all_feature_ids=all_feature_ids,
+    )
+    payloads = pl.get("payloads", {}) or {}
+    if not payloads:
+        import pandas as pd
+        return pd.DataFrame()
+    first_payload = next(iter(payloads.values()))
+    return payload_to_df(first_payload)
+
+
 def save_all_plots(
     sim: CobwebSim,
     data_rows: RowsDict,
@@ -327,7 +364,6 @@ def save_all_plots(
         )
     """
     from .plots import save_api_payloads_to_html
-    from .client import CobwebError
 
     out_dir = Path(out_dir)
     results: Dict[int, List[str]] = {}
@@ -363,6 +399,45 @@ def save_all_plots(
         results[pid] = html_files
 
     return results
+
+
+def signal_label(value: float) -> str:
+    """
+    Convert a numeric signal value to a human-readable label.
+
+    Returns ``"BUY"`` for 1.0, ``"SELL"`` for -1.0, ``"HOLD"`` otherwise.
+
+    Example::
+
+        label = signal_label(signals[-1])  # "BUY"
+    """
+    if value == 1.0:
+        return "BUY"
+    elif value == -1.0:
+        return "SELL"
+    return "HOLD"
+
+
+def format_metrics(bt: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Extract and format backtest metrics as a display-ready dict.
+
+    Returns a dict with human-readable keys and pre-formatted values
+    (e.g. percentages, dollar amounts). Suitable for passing to
+    ``save_table()`` or ``pd.DataFrame()``.
+
+    Example::
+
+        cw.save_table([cw.format_metrics(bt)], "metrics.html", title="Metrics")
+    """
+    from .plots import _METRIC_LABELS, _fmt_metric
+
+    m = bt.get("metrics", {})
+    result: Dict[str, str] = {}
+    for key, label in _METRIC_LABELS.items():
+        if key in m:
+            result[label] = _fmt_metric(key, m[key])
+    return result
 
 
 def get_signal(bt: Dict[str, Any]) -> Dict[str, Any]:

@@ -1,19 +1,17 @@
 from __future__ import annotations
 
+from html import escape as _esc
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Union, Optional, Tuple
 import json
 import math
 
-try:
-    import pandas as pd
-except Exception:  # pragma: no cover
-    pd = None  # type: ignore
+import pandas as pd
 
 try:
     import plotly.graph_objects as go  # type: ignore
     from plotly.subplots import make_subplots  # type: ignore
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     go = None  # type: ignore
     make_subplots = None  # type: ignore
 
@@ -90,7 +88,7 @@ def _make_title(*parts: str) -> str:
     return s.strip() or "Plot"
 
 
-def _ensure_plotly():
+def _ensure_plotly() -> None:
     if go is None:
         raise RuntimeError("plotly is required for HTML plots. Install with: pip install plotly")
 
@@ -99,10 +97,9 @@ def _ensure_plotly():
 # Dataframe helpers
 # ----------------------------
 
-def _to_df(obj: Any):
-    if pd is None:
-        raise RuntimeError("pandas is required for plotting helpers. Install with: pip install pandas")
-    if hasattr(obj, "__class__") and obj.__class__.__name__ == "DataFrame":
+def _to_df(obj: Any) -> pd.DataFrame:
+    """Coerce various input shapes to a DataFrame."""
+    if isinstance(obj, pd.DataFrame):
         return obj.copy()
     if isinstance(obj, dict) and "rows" in obj:
         return pd.DataFrame(obj["rows"])
@@ -113,14 +110,14 @@ def _to_df(obj: Any):
     raise ValueError("Unsupported input type for plotting.")
 
 
-def _pick_x(df):
+def _pick_x(df: pd.DataFrame) -> str:
     for c in ("timestamp", "time", "date", "Datetime", "Date", "index", "bar", "t"):
         if c in df.columns:
             return c
     return df.columns[0]
 
 
-def _pick_equity_y(df):
+def _pick_equity_y(df: pd.DataFrame) -> str:
     for c in ("equity", "Equity", "portfolio_value", "value", "nav", "cash"):
         if c in df.columns:
             return c
@@ -162,15 +159,17 @@ def save_line_plot(
 
 
 def _write_note_html(path: Union[str, Path], title: str, msg: str) -> None:
+    safe_title = _esc(title)
+    safe_msg = _esc(msg)
     html = f"""<!doctype html>
 <html>
   <head>
     <meta charset="utf-8">
-    <title>{title}</title>
+    <title>{safe_title}</title>
   </head>
   <body style="font-family: sans-serif; padding: 16px;">
-    <h2>{title}</h2>
-    <p>{msg}</p>
+    <h2>{safe_title}</h2>
+    <p>{safe_msg}</p>
   </body>
 </html>
 """
@@ -191,7 +190,7 @@ def _as_float_matrix(z: Any) -> List[List[float]]:
                 fv = float(v)
                 if not math.isfinite(fv):
                     fv = float("nan")
-            except Exception:
+            except (ValueError, TypeError):
                 fv = float("nan")
             r2.append(fv)
         out.append(r2)
@@ -322,7 +321,7 @@ def payload_to_figure(
 
     # ---------- SPECIAL CASES FIRST (many include "t") ----------
 
-    # Special: volume shock (plot 25) — MUST come before generic (t + series)
+    # Special: volume shock (plot 25) -- MUST come before generic (t + series)
     if (
         isinstance(p, dict)
         and isinstance(p.get("t"), list)
@@ -635,10 +634,12 @@ def save_api_payloads_to_html(
         else:
             # Fallback: write payload as JSON for inspection
             base_title = _make_title(title_prefix.rstrip(), name)
+            safe_title = _esc(base_title)
             raw = json.dumps(p, indent=2, ensure_ascii=False) if not isinstance(p, str) else p
+            safe_raw = _esc(raw)
             out_path.write_text(
-                f"<html><head><meta charset='utf-8'><title>{base_title}</title></head>"
-                f"<body><h2>{base_title}</h2><pre style='white-space:pre-wrap;'>{raw}</pre></body></html>",
+                f"<html><head><meta charset='utf-8'><title>{safe_title}</title></head>"
+                f"<body><h2>{safe_title}</h2><pre style='white-space:pre-wrap;'>{safe_raw}</pre></body></html>",
                 encoding="utf-8",
             )
 
@@ -649,7 +650,6 @@ def save_api_payloads_to_html(
 
 # ----------------------------
 # API payload plots -> DataFrames
-# (kept mostly the same, but cleaned up)
 # ----------------------------
 
 def save_api_payloads_to_dfs(
@@ -657,26 +657,33 @@ def save_api_payloads_to_dfs(
     *,
     fallback: str = "json",  # "json" | "normalize" | "none"
 ) -> Dict[str, "pd.DataFrame"]:
-    if pd is None:
-        raise RuntimeError("pandas is required. Install with: pip install pandas")
-
     out: Dict[str, pd.DataFrame] = {}
     for name, p in (payloads or {}).items():
-        out[name] = _payload_to_df(p, fallback=fallback)
+        out[name] = payload_to_df(p, fallback=fallback)
     return out
 
 
-def _payload_to_df(p: Any, *, fallback: str = "json") -> "pd.DataFrame":
+def payload_to_df(p: Any, *, fallback: str = "json") -> "pd.DataFrame":
     """
-    Convert a plot payload to a pandas DataFrame.
+    Convert a single plot payload to a pandas DataFrame.
+
+    Parameters
+    ----------
+    p : Any
+        A single plot payload dict returned by the CobwebSim API.
+    fallback : str
+        How to handle unrecognised shapes: ``"json"`` (default) stores the
+        raw JSON string, ``"normalize"`` uses ``pd.json_normalize``,
+        ``"none"`` returns an empty DataFrame.
+
+    Returns
+    -------
+    pd.DataFrame
 
     Rules:
     - No plotting / file writing / loop control here.
     - Order special-case payloads before generic ones (e.g., volume_shock before t+series).
     """
-    if pd is None:
-        raise RuntimeError("pandas is required. Install with: pip install pandas")
-
     # ---------- SPECIAL CASES FIRST ----------
 
     # Case 9: volume shock (t + volume + adv + vol_shock)
@@ -772,7 +779,6 @@ def _payload_to_df(p: Any, *, fallback: str = "json") -> "pd.DataFrame":
         return pd.DataFrame(data)
 
     # Case 2: histogram payload (bins + counts)
-    # IMPORTANT: In DataFrame form, keep it semantic: "value" + "count"
     if isinstance(p, dict) and isinstance(p.get("bins"), list) and isinstance(p.get("counts"), list):
         bins = p.get("bins", [])
         counts = p.get("counts", [])
@@ -815,7 +821,7 @@ def _payload_to_df(p: Any, *, fallback: str = "json") -> "pd.DataFrame":
     except Exception:
         raw = str(p)
     return pd.DataFrame({"payload_json": [raw]})
-    
+
 
 def save_features_table(
     rows_or_df: Any,
@@ -830,12 +836,8 @@ def save_features_table(
     """
     Save a stylized HTML table + a CSV snapshot of the features rows.
 
-    Mode A:
-      Pins core columns first (timestamp/date + OHLCV + Volume), then all feature columns.
+    Pins core columns first (timestamp/date + OHLCV + Volume), then all feature columns.
     """
-    if pd is None:
-        raise RuntimeError("pandas is required for table export. Install with: pip install pandas")
-
     df = _to_df(rows_or_df)
 
     if max_rows is not None:
@@ -902,12 +904,13 @@ def save_features_table(
         pass
 
     table_html = styler.to_html()
+    safe_title = _esc(title)
 
     html_doc = f"""<!doctype html>
 <html>
   <head>
     <meta charset="utf-8">
-    <title>{title}</title>
+    <title>{safe_title}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
       body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; }}
@@ -959,7 +962,7 @@ _PCT_METRICS = {
 
 def _fmt_metric(key: str, val: Any) -> str:
     if val is None or (isinstance(val, float) and math.isnan(val)):
-        return "—"
+        return "---"
     if key == "final_equity":
         return f"${float(val):,.2f}"
     if key in _PCT_METRICS:
@@ -991,10 +994,11 @@ def save_metrics_table(
     for key, label in _METRIC_LABELS.items():
         if key not in metrics:
             continue
-        val_str = _fmt_metric(key, metrics[key])
+        val_str = _esc(_fmt_metric(key, metrics[key]))
+        safe_label = _esc(label)
         rows_html += (
             f"<tr>"
-            f"<td style='padding:9px 14px;border-bottom:1px solid #e2e8f0;color:#475569;font-weight:500'>{label}</td>"
+            f"<td style='padding:9px 14px;border-bottom:1px solid #e2e8f0;color:#475569;font-weight:500'>{safe_label}</td>"
             f"<td style='padding:9px 14px;border-bottom:1px solid #e2e8f0;text-align:right;font-variant-numeric:tabular-nums'>{val_str}</td>"
             f"</tr>"
         )
@@ -1005,7 +1009,7 @@ def save_metrics_table(
     signal_color = {"buy": "#16a34a", "sell": "#dc2626"}.get(signal, "#64748b")
     signal_html = (
         f"<div style='margin-top:16px;padding:12px 16px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0'>"
-        f"<span style='font-weight:700;color:{signal_color};font-size:15px'>{signal.upper() if signal else '—'}</span>"
+        f"<span style='font-weight:700;color:{signal_color};font-size:15px'>{_esc(signal.upper()) if signal else '---'}</span>"
         + (f" &nbsp;|&nbsp; exposure <b>{exposure:.2f}</b>" if exposure is not None else "")
         + (f" &nbsp;|&nbsp; strength <b>{strength:.2f}</b>" if strength is not None else "")
         + "</div>"
@@ -1059,8 +1063,8 @@ def save_trades_table(
     headers = ["Time", "Side", "Fill Price", "Units", "Fee", "TCA Cost", "Target Exp."]
 
     header_html = "".join(
-        f"<th style='padding:10px 12px;text-align:{"right" if i > 1 else "left"};background:#0f172a;"
-        f"color:white;font-weight:600;border-bottom:1px solid #334155;white-space:nowrap'>{h}</th>"
+        f"<th style='padding:10px 12px;text-align:{('right' if i > 1 else 'left')};background:#0f172a;"
+        f"color:white;font-weight:600;border-bottom:1px solid #334155;white-space:nowrap'>{_esc(h)}</th>"
         for i, h in enumerate(headers)
     )
 
@@ -1075,13 +1079,13 @@ def save_trades_table(
         for j, col in enumerate(cols):
             val = trade.get(col, "")
             if col == "side":
-                cell = f"<span style='color:{side_color};font-weight:600'>{side_label}</span>"
+                cell = f"<span style='color:{side_color};font-weight:600'>{_esc(side_label)}</span>"
             elif col == "t":
-                cell = str(val)
+                cell = _esc(str(val))
             elif isinstance(val, float):
                 cell = f"{val:.4f}" if col == "fill" else f"{val:.6f}"
             else:
-                cell = str(val) if val != "" else "—"
+                cell = _esc(str(val)) if val != "" else "---"
             align = "right" if j > 1 else "left"
             cells.append(
                 f"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:{align};"

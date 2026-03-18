@@ -1,13 +1,11 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any, List, Mapping, Dict, Optional, Union, Tuple
 
-try:
-    import pandas as pd
-except Exception:  # pragma: no cover
-    pd = None  # type: ignore
+import pandas as pd
 
-# Feature ID -> column name mapping
+# Feature ID -> column name mapping (single source of truth for the package)
 FEATURES: Dict[int, str] = {
     1: "ret_1d",
     2: "logret_1d",
@@ -145,8 +143,8 @@ _FEATURE_NOTES: Dict[int, str] = {
     13: "score_by_id() converts to sma_signal = (Close - MA) / MA",
     14: "score_by_id() converts to sma_signal = (Close - MA) / MA",
     15: "score_by_id() converts to sma_signal = (Close - MA) / MA",
-    36: "auto-scaled to 0-1 range (÷100) when rsi_to_unit=True",
-    37: "auto-scaled to 0-1 range (÷100) when rsi_to_unit=True",
+    36: "auto-scaled to 0-1 range (/100) when rsi_to_unit=True",
+    37: "auto-scaled to 0-1 range (/100) when rsi_to_unit=True",
 }
 
 # Category labels for plots (id -> category string)
@@ -163,19 +161,15 @@ _PLOT_NOTES: Dict[int, str] = {
     3:  "requires benchmark data",
     8:  "requires benchmark data",
     9:  "requires benchmark data",
-    20: "requires feature_id=71 (vol_regime) — pass feature_ids=[71]",
-    21: "requires feature_id=70 (trend_regime) — pass feature_ids=[70]",
+    20: "requires feature_id=71 (vol_regime) -- pass feature_ids=[71]",
+    21: "requires feature_id=70 (trend_regime) -- pass feature_ids=[70]",
     22: "requires bull/bear regime columns from backtest",
-    23: "requires all feature_ids to be computed — pass feature_ids=[1..71]",
+    23: "requires all feature_ids to be computed -- pass feature_ids=[1..71]",
 }
 
-# Sorted lists of valid category strings — public so users can inspect them
+# Sorted lists of valid category strings -- public so users can inspect them
 FEATURE_CATS: List[str] = sorted(set(_FEATURE_CATEGORIES.values()))
 PLOT_CATS:    List[str] = sorted(set(_PLOT_CATEGORIES.values()))
-
-# Private aliases used internally (keeps internal references short)
-_FEATURE_CATS = FEATURE_CATS
-_PLOT_CATS    = PLOT_CATS
 
 
 def show_categories() -> None:
@@ -183,7 +177,7 @@ def show_categories() -> None:
     Print all valid category names for features and plots.
 
     These are the exact strings accepted by list_features(), list_plots(),
-    show_features(), and show_plots() — fuzzy variants also work
+    show_features(), and show_plots() -- fuzzy variants also work
     (e.g. 'betacorr', 'vol', 'perf').
 
     Example:
@@ -204,11 +198,11 @@ def _resolve_category(query: str, valid: List[str]) -> List[str]:
 
     Matching order (most specific wins):
       1. Exact match after normalising (lowercase, strip _, - and spaces)
-      2. Prefix match  — query is a prefix of one or more categories
-      3. Substring match — query appears anywhere inside a category
+      2. Prefix match  -- query is a prefix of one or more categories
+      3. Substring match -- query appears anywhere inside a category
 
     Returns a list of matched original category strings (may be >1 for
-    ambiguous prefixes like "vol" → ["volatility", "volume"]).
+    ambiguous prefixes like "vol" -> ["volatility", "volume"]).
     Returns [] when nothing matches.
     """
     def _norm(s: str) -> str:
@@ -238,7 +232,7 @@ def _resolve_plot_id(query: str) -> int:
     Uses the same normalisation (lowercase, strip _, - and spaces) as
     _resolve_category, then matches against PLOTS names (not categories).
 
-    Raises ValueError when the query is ambiguous or unrecognised — the
+    Raises ValueError when the query is ambiguous or unrecognised -- the
     message includes all matching or available plot names so the caller
     can refine their input. Use show_plots() for a full reference.
     """
@@ -262,7 +256,7 @@ def _resolve_plot_id(query: str) -> int:
         return prefix[0]
     if len(prefix) > 1:
         raise ValueError(
-            f"Ambiguous plot name '{query}' — {len(prefix)} matches: {_fmt(prefix)}. "
+            f"Ambiguous plot name '{query}' -- {len(prefix)} matches: {_fmt(prefix)}. "
             f"Be more specific."
         )
 
@@ -272,7 +266,7 @@ def _resolve_plot_id(query: str) -> int:
         return sub[0]
     if len(sub) > 1:
         raise ValueError(
-            f"Ambiguous plot name '{query}' — {len(sub)} matches: {_fmt(sub)}. "
+            f"Ambiguous plot name '{query}' -- {len(sub)} matches: {_fmt(sub)}. "
             f"Be more specific."
         )
 
@@ -287,8 +281,8 @@ def list_features(category: Optional[str] = None) -> List[Dict[str, Any]]:
     Return all 71 feature IDs as a list of dicts: id, name, category.
 
     Args:
-        category: optional fuzzy filter — exact, prefix, or partial match.
-                  e.g. "rsi", "vol" (→ volatility + volume), "betacorr",
+        category: optional fuzzy filter -- exact, prefix, or partial match.
+                  e.g. "rsi", "vol" (-> volatility + volume), "betacorr",
                   "mean", "stoch", "trend"
 
     Valid categories:
@@ -312,7 +306,7 @@ def list_features(category: Optional[str] = None) -> List[Dict[str, Any]]:
     ]
     if category is None:
         return all_rows
-    matched = _resolve_category(category, _FEATURE_CATS)
+    matched = _resolve_category(category, FEATURE_CATS)
     return [r for r in all_rows if r["category"] in matched]
 
 
@@ -321,8 +315,8 @@ def list_plots(category: Optional[str] = None) -> List[Dict[str, Any]]:
     Return all 27 plot IDs as a list of dicts: id, name, category.
 
     Args:
-        category: optional fuzzy filter — exact, prefix, or partial match.
-                  e.g. "trades", "perf" (→ performance), "exec", "diag"
+        category: optional fuzzy filter -- exact, prefix, or partial match.
+                  e.g. "trades", "perf" (-> performance), "exec", "diag"
 
     Valid categories:
         performance, trades, regime, diagnostics, volume_execution
@@ -344,13 +338,13 @@ def list_plots(category: Optional[str] = None) -> List[Dict[str, Any]]:
     ]
     if category is None:
         return all_rows
-    matched = _resolve_category(category, _PLOT_CATS)
+    matched = _resolve_category(category, PLOT_CATS)
     return [r for r in all_rows if r["category"] in matched]
 
 
 def show_features(category: Optional[str] = None) -> None:
     """
-    Print a formatted feature reference table to stdout (no pandas needed).
+    Print a formatted feature reference table to stdout.
 
     Args:
         category: optional fuzzy filter (same as list_features)
@@ -363,7 +357,7 @@ def show_features(category: Optional[str] = None) -> None:
     """
     rows = list_features(category=category)
     if not rows:
-        valid = ", ".join(_FEATURE_CATS)
+        valid = ", ".join(FEATURE_CATS)
         print(f"No features matched '{category}'. Valid categories: {valid}")
         return
 
@@ -371,14 +365,14 @@ def show_features(category: Optional[str] = None) -> None:
     w_cat  = max(len(r["category"]) for r in rows)
 
     print(f"{'ID':>4}  {'Name':<{w_name}}  {'Category':<{w_cat}}")
-    print(f"{'─'*4}  {'─'*w_name}  {'─'*w_cat}")
+    print(f"{'---':>4}  {'-'*w_name}  {'-'*w_cat}")
     for r in rows:
         print(f"{r['id']:>4}  {r['name']:<{w_name}}  {r['category']:<{w_cat}}")
 
 
 def show_plots(category: Optional[str] = None) -> None:
     """
-    Print a formatted plot reference table to stdout (no pandas needed).
+    Print a formatted plot reference table to stdout.
 
     Args:
         category: optional fuzzy filter (same as list_plots)
@@ -391,7 +385,7 @@ def show_plots(category: Optional[str] = None) -> None:
     """
     rows = list_plots(category=category)
     if not rows:
-        valid = ", ".join(_PLOT_CATS)
+        valid = ", ".join(PLOT_CATS)
         print(f"No plots matched '{category}'. Valid categories: {valid}")
         return
 
@@ -399,16 +393,14 @@ def show_plots(category: Optional[str] = None) -> None:
     w_cat  = max(len(r["category"]) for r in rows)
 
     print(f"{'ID':>4}  {'Name':<{w_name}}  {'Category':<{w_cat}}")
-    print(f"{'─'*4}  {'─'*w_name}  {'─'*w_cat}")
+    print(f"{'---':>4}  {'-'*w_name}  {'-'*w_cat}")
     for r in rows:
         print(f"{r['id']:>4}  {r['name']:<{w_name}}  {r['category']:<{w_cat}}")
 
 
-def _to_df(rows_or_df: Any):
-    if pd is None:
-        raise RuntimeError("pandas is required for scoring helpers. Install with: pip install pandas")
-
-    if hasattr(rows_or_df, "__class__") and rows_or_df.__class__.__name__ == "DataFrame":
+def _to_df(rows_or_df: Any) -> pd.DataFrame:
+    """Coerce various input shapes to a DataFrame."""
+    if isinstance(rows_or_df, pd.DataFrame):
         return rows_or_df.copy()
     if isinstance(rows_or_df, dict) and "rows" in rows_or_df:
         return pd.DataFrame(rows_or_df["rows"])
@@ -417,8 +409,8 @@ def _to_df(rows_or_df: Any):
     raise ValueError("Provide a DataFrame, list of dict rows, or dict with {'rows': [...]}.")
 
 
-def zscore(series):
-    # ddof=0 is slightly faster and stable; fine for scoring
+def zscore(series: Any) -> pd.Series:
+    """Z-score a series (ddof=0 for stability)."""
     s = pd.to_numeric(series, errors="coerce")
     mu = s.mean(skipna=True)
     sd = s.std(skipna=True, ddof=0)
@@ -436,6 +428,9 @@ def score(
 ) -> List[float]:
     """
     Compute weighted scores using COLUMN NAMES (strings).
+
+    Warns if a requested column is missing from the data (contribution
+    defaults to 0.0 for that column).
     """
     df = _to_df(rows_or_df)
 
@@ -456,6 +451,12 @@ def score(
 
     _acc = None
     for col, w in weights.items():
+        if col not in df.columns and col != "sma_signal":
+            warnings.warn(
+                f"score(): column '{col}' not found in data -- contribution will be 0.0. "
+                f"Available columns: {list(df.columns)[:15]}...",
+                stacklevel=2,
+            )
         contrib = pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(0.0, index=df.index)
 
         if rsi_to_unit and isinstance(col, str) and col.lower().startswith("rsi"):
@@ -499,6 +500,8 @@ def score_by_id(
         it contributes to a derived `sma_signal` term (Close - MA)/MA
       - RSI columns can be scaled to 0..1 via /100
       - Non-RSI columns are optionally z-scored (normalize=True)
+
+    Warns if a feature ID is not recognised.
     """
     df = _to_df(rows_or_df)
 
@@ -509,10 +512,18 @@ def score_by_id(
     for fid, w in weights_by_id.items():
         try:
             fid_int = int(fid)
-        except Exception:
+        except (ValueError, TypeError):
+            warnings.warn(
+                f"score_by_id(): cannot convert feature ID {fid!r} to int -- skipping.",
+                stacklevel=2,
+            )
             continue
         col = FEATURES.get(fid_int)
         if not col:
+            warnings.warn(
+                f"score_by_id(): feature ID {fid_int} not recognised (valid: 1-71) -- skipping.",
+                stacklevel=2,
+            )
             continue
 
         w = float(w)
@@ -537,9 +548,14 @@ def score_by_id(
         else:
             df["sma_signal"] = 0.0
 
-    # Compute score without extra conversions
+    # Compute score
     _acc = None
     for col, w in name_weights.items():
+        if col not in df.columns and col != "sma_signal":
+            warnings.warn(
+                f"score_by_id(): column '{col}' not found in data -- contribution will be 0.0.",
+                stacklevel=2,
+            )
         contrib = pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(0.0, index=df.index)
 
         if rsi_to_unit and col.lower().startswith("rsi"):

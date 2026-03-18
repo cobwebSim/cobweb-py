@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cobweb-py"
-version = "0.1.1"
-description = "Python SDK for the CobwebSim stock simulation and backtesting API. Compute 71 technical features, run backtests with realistic execution modeling, and generate 27 plot types."
+version = "0.3.0"
+description = "Python SDK for the CobwebSim stock simulation and backtesting API. Compute 71 technical features, run backtests with realistic execution modeling, generate 27 plot types, and deploy strategies to Alpaca."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
-keywords = ["trading", "backtesting", "finance", "stock", "simulation", "technical-analysis", "quantitative-finance"]
+keywords = ["trading", "backtesting", "finance", "stock", "simulation", "technical-analysis", "quantitative-finance", "alpaca", "paper-trading", "algo-trading"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -24,12 +24,23 @@ classifiers = [
 ]
 dependencies = [
     "requests>=2.31",
+    "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
 viz = [
-    "pandas>=2.0",
     "plotly>=5.0",
+]
+yahoo = [
+    "yfinance>=0.2",
+]
+alpaca = [
+    "alpaca-trade-api>=3.0",
+]
+all = [
+    "plotly>=5.0",
+    "yfinance>=0.2",
+    "alpaca-trade-api>=3.0",
 ]
 
 [project.urls]
@@ -37,7 +48,7 @@ Homepage = "https://cobweb.market"
 Documentation = "https://cobweb.market/docs.html"
 Repository = "https://github.com/cobwebSim/cobweb-py"
 Issues = "https://github.com/cobwebSim/cobweb-py/issues"
-Examples = "https://github.com/cobwebSim/cobweb-py-examples"
+Examples = "https://github.com/cobwebSim/backtest_under_20"
 
 [tool.setuptools.packages.find]
 include = ["cobweb_py*"]
